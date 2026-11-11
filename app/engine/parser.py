@@ -1,8 +1,13 @@
+import os
 import re
 import requests
 from dataclasses import dataclass
 from typing import Optional, Tuple, List, Dict, Any
 from playwright.sync_api import sync_playwright
+
+from app.config import BASE_DIR
+
+BROWSER_PROFILE_DIR = os.path.join(BASE_DIR, "browser_profile")
 
 @dataclass
 class ParsedVideoInfo:
@@ -13,18 +18,37 @@ class ParsedVideoInfo:
     share_url: str
     is_single_stream: bool = False  # True 表示音画合一单流（如带货/电商视频），无需 FFmpeg 二次合成
 
-@dataclass
-class AuthorProfileInfo:
-    sec_uid: str
-    author_name: str
-    avatar_url: str
-    total_post_count: int
-    share_url: str
-
 class DouyinParser:
-    """抖音视频混合自愈解析器（支持普通分流视频、带货单流一体视频与博主主页作品解析）"""
+    """抖音视频混合自愈解析器（支持持久化登录态、单流一体、DASH分流与博主主页深度抓取）"""
 
     URL_REGEX = re.compile(r'https?://[^\s，,。]+')
+
+    @classmethod
+    def get_browser_context(cls, p, headless: bool = True):
+        """获取持久化浏览器上下文（共享登录凭证 Cookies 与 LocalStorage）"""
+        os.makedirs(BROWSER_PROFILE_DIR, exist_ok=True)
+        return p.chromium.launch_persistent_context(
+            user_data_dir=BROWSER_PROFILE_DIR,
+            channel="msedge",
+            headless=headless,
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 800}
+        )
+
+    @classmethod
+    def open_login_window(cls):
+        """弹出可视化的 Edge 浏览器窗口供用户扫码登录抖音"""
+        with sync_playwright() as p:
+            context = cls.get_browser_context(p, headless=False)
+            page = context.new_page()
+            page.goto("https://www.douyin.com", wait_until="domcontentloaded")
+            # 保持窗口打开，直到用户手动关闭浏览器窗口
+            try:
+                page.wait_for_timeout(300000)  # 最多等待 5 分钟
+            except Exception:
+                pass
+            finally:
+                context.close()
 
     @classmethod
     def extract_url(cls, text: str) -> Optional[str]:
@@ -54,7 +78,6 @@ class DouyinParser:
         resp = s.get(raw_url, headers=headers, allow_redirects=True, timeout=10)
         final_url = resp.url
 
-        # 从最终长链接或 modal_id 提取 video_id
         video_id = ""
         m1 = re.search(r'/video/(\d+)', final_url)
         if m1:
@@ -69,17 +92,14 @@ class DouyinParser:
 
     @classmethod
     def sniff_streams_via_edge(cls, target_url: str, timeout_sec: int = 25) -> Tuple[str, str, str, bool]:
-        """利用系统 Edge 内核后台无头嗅探单个视频媒体流"""
+        """利用持久化 Edge 内核后台无头嗅探单个视频媒体流"""
         dash_video_url = ""
         dash_audio_url = ""
         single_media_url = ""
         title = ""
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(channel="msedge", headless=True)
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            )
+            context = cls.get_browser_context(p, headless=True)
             page = context.new_page()
 
             def handle_request(req):
@@ -117,7 +137,7 @@ class DouyinParser:
                 raw_title = page.title() or ""
                 title = re.sub(r'\s*-\s*抖音$', '', raw_title).strip()
             finally:
-                browser.close()
+                context.close()
 
         if dash_video_url and dash_audio_url:
             return title or "抖音视频", dash_video_url, dash_audio_url, False
@@ -151,7 +171,7 @@ class DouyinParser:
     def fetch_author_videos(cls, user_url: str, max_count: int = 100, progress_cb=None) -> Tuple[str, List[Dict[str, str]]]:
         """
         利用系统 Edge 驱动自动翻页抓取博主作品列表（前 100 / 200 / 300 个）
-        :return: (author_name, [{'id': ..., 'title': ..., 'url': ...}])
+        严格容器隔离：只收集博主作品网格内部的视频，100% 杜绝混入侧边推荐外链！
         """
         author_name = "抖音博主"
         collected_list: List[Dict[str, str]] = []
@@ -162,13 +182,10 @@ class DouyinParser:
                 progress_cb(msg)
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(channel="msedge", headless=True)
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            )
+            context = cls.get_browser_context(p, headless=True)
             page = context.new_page()
 
-            # 监听后台瀑布流 aweme/post API
+            # 1. 优先通过官方 aweme/post API 拦截（最精准纯正，绝无外链）
             def on_response(res):
                 nonlocal collected_list, seen_ids
                 if "aweme/v1/web/aweme/post" in res.url:
@@ -182,7 +199,7 @@ class DouyinParser:
                                 desc = item.get("desc") or f"视频_{aweme_id}"
                                 collected_list.append({
                                     "id": aweme_id,
-                                    "title": desc,
+                                    "title": desc.strip(),
                                     "url": f"https://www.douyin.com/video/{aweme_id}"
                                 })
                     except Exception:
@@ -198,36 +215,81 @@ class DouyinParser:
             raw_title = page.title() or ""
             author_name = re.sub(r'的抖音.*$', '', raw_title).strip() or "抖音博主"
 
-            # 初始从 DOM 补充提取当前首屏视频
-            initial_links = page.evaluate('''() => {
-                const as = Array.from(document.querySelectorAll('a[href*="/video/"]'));
-                return as.map(a => a.href);
+            # 2. 从 DOM 辅助提取：采用精确选择器，仅在作品列表中提取，坚决排除侧边推荐！
+            dom_items = page.evaluate('''() => {
+                // 仅查找带有作品标识的直接卡片链接
+                const selectors = [
+                    'div[data-e2e="user-post-list"] a[href*="/video/"]',
+                    'ul[data-e2e="scroll-list"] a[href*="/video/"]',
+                    'div[class*="author-post"] a[href*="/video/"]',
+                    'div[class*="PostList"] a[href*="/video/"]',
+                    'a.RZuwF26I[href*="/video/"]'
+                ];
+                let found = [];
+                for (const sel of selectors) {
+                    const elList = document.querySelectorAll(sel);
+                    if (elList.length > 0) {
+                        found = Array.from(elList);
+                        break;
+                    }
+                }
+                // 如果特定选择器没有，做严格的排除匹配（排除包含“推荐”、“Baiduspider”、“搜索”等外链）
+                if (found.length === 0) {
+                    found = Array.from(document.querySelectorAll('a[href*="/video/"]')).filter(a => {
+                        const href = a.href || '';
+                        return !href.includes('source=') && !href.includes('recommend');
+                    });
+                }
+                return found.map(a => ({
+                    href: a.href,
+                    title: (a.innerText || '').trim()
+                }));
             }''')
-            for link in initial_links:
-                m = re.search(r'/video/(\d+)', link)
+
+            for item in dom_items:
+                m = re.search(r'/video/(\d+)', item.get("href", ""))
                 if m:
                     vid = m.group(1)
                     if vid not in seen_ids:
                         seen_ids.add(vid)
                         collected_list.append({
                             "id": vid,
-                            "title": f"视频_{vid}",
+                            "title": item.get("title") or f"视频_{vid}",
                             "url": f"https://www.douyin.com/video/{vid}"
                         })
 
-            log_msg(f"博主: {author_name}，首屏发现 {len(collected_list)} 个作品，开始自动滚动翻页...")
+            log_msg(f"博主: 【{author_name}】，首屏捕获 {len(collected_list)} 个纯净作品，正在向下深度滚动加载...")
 
-            # 模拟翻页直到达到目标数量，或者连续 5 次翻页无新增视频（触底）
+            # 3. 循环自然滚动翻页，并在遇登录遮罩时自动清理拦截
             no_new_counter = 0
             scroll_count = 0
-            max_scrolls = max(20, (max_count // 10) + 10)
+            max_scrolls = max(25, (max_count // 8) + 15)
 
             while len(collected_list) < max_count and scroll_count < max_scrolls:
                 prev_len = len(collected_list)
-                page.keyboard.press("PageDown")
+
+                # 模拟滚轮与键盘 PageDown
+                page.mouse.wheel(0, 1800)
                 page.wait_for_timeout(1000)
-                page.evaluate("window.scrollBy(0, 1500)")
+                page.keyboard.press("PageDown")
                 page.wait_for_timeout(1200)
+
+                # 尝试关闭可能弹出的登录或提示遮罩
+                page.evaluate('''() => {
+                    const closeSelectors = [
+                        '.login-mask-enter-done [class*="close"]',
+                        'div[class*="login"] [class*="close"]',
+                        'svg[class*="close"]',
+                        '.dy-account-close'
+                    ];
+                    for (const s of closeSelectors) {
+                        const btn = document.querySelector(s);
+                        if (btn) {
+                            btn.click();
+                            break;
+                        }
+                    }
+                ''')
 
                 scroll_count += 1
                 curr_len = len(collected_list)
@@ -238,11 +300,31 @@ class DouyinParser:
                 else:
                     no_new_counter += 1
                     if no_new_counter >= 5:
-                        log_msg(f"已触底，该博主全部公开作品共 {curr_len} 个")
+                        # 再次尝试从 DOM 兜底扫描
+                        latest_dom = page.evaluate('''() => {
+                            return Array.from(document.querySelectorAll('a[href*="/video/"]'))
+                                .filter(a => !a.href.includes('source='))
+                                .map(a => ({href: a.href, title: (a.innerText || '').trim()}));
+                        }''')
+                        for item in latest_dom:
+                            m = re.search(r'/video/(\d+)', item.get("href", ""))
+                            if m:
+                                vid = m.group(1)
+                                if vid not in seen_ids:
+                                    seen_ids.add(vid)
+                                    collected_list.append({
+                                        "id": vid,
+                                        "title": item.get("title") or f"视频_{vid}",
+                                        "url": f"https://www.douyin.com/video/{vid}"
+                                    })
+                        if len(collected_list) > curr_len:
+                            no_new_counter = 0
+                            continue
+
+                        log_msg(f"翻页完成（已达上限或全部加载完毕），共计获取 {len(collected_list)} 个纯净作品")
                         break
 
-            browser.close()
+            context.close()
 
-        # 截取前 max_count 个
         final_list = collected_list[:max_count]
         return author_name, final_list

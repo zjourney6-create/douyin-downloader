@@ -6,6 +6,7 @@ __pycache__/
 # Local user config & history
 config.json
 *.json.bak
+browser_profile/
 
 # Local media downloads & temp files
 downloads/
