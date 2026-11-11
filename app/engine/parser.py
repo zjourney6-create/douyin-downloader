@@ -275,21 +275,24 @@ class DouyinParser:
                 page.wait_for_timeout(1200)
 
                 # 尝试关闭可能弹出的登录或提示遮罩
-                page.evaluate('''() => {
-                    const closeSelectors = [
-                        '.login-mask-enter-done [class*="close"]',
-                        'div[class*="login"] [class*="close"]',
-                        'svg[class*="close"]',
-                        '.dy-account-close'
-                    ];
-                    for (const s of closeSelectors) {
-                        const btn = document.querySelector(s);
-                        if (btn) {
-                            btn.click();
-                            break;
+                try:
+                    page.evaluate('''() => {
+                        const closeSelectors = [
+                            '.login-mask-enter-done [class*="close"]',
+                            'div[class*="login"] [class*="close"]',
+                            'svg[class*="close"]',
+                            '.dy-account-close'
+                        ];
+                        for (const s of closeSelectors) {
+                            const btn = document.querySelector(s);
+                            if (btn) {
+                                btn.click();
+                                break;
+                            }
                         }
-                    }
-                ''')
+                    }''')
+                except Exception:
+                    pass
 
                 scroll_count += 1
                 curr_len = len(collected_list)
