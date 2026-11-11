@@ -49,7 +49,16 @@ def install_builtin_chromium(progress_cb: Optional[Callable[[str], None]] = None
     env = os.environ.copy()
     env["PLAYWRIGHT_DOWNLOAD_HOST"] = "https://npmmirror.com/mirrors/playwright/"
 
-    cmd = [sys.executable, "-m", "playwright", "install", "chromium"]
+    try:
+        from playwright._impl._driver import compute_driver_executable
+        driver_exec, _ = compute_driver_executable()
+        cli_js = os.path.join(os.path.dirname(driver_exec), "package", "cli.js")
+        if os.path.exists(cli_js):
+            cmd = [str(driver_exec), cli_js, "install", "chromium"]
+        else:
+            cmd = [sys.executable, "-m", "playwright", "install", "chromium"]
+    except Exception:
+        cmd = [sys.executable, "-m", "playwright", "install", "chromium"]
     try:
         proc = subprocess.Popen(
             cmd,

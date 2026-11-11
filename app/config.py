@@ -1,8 +1,13 @@
 import json
 import os
+import sys
 from typing import Dict, Any, List
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if getattr(sys, 'frozen', False):
+    BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 DEFAULT_DOWNLOAD_DIR = os.path.join(BASE_DIR, "downloads")
 

@@ -6,12 +6,21 @@ import sys
 def get_ffmpeg_path() -> str:
     """探测 FFmpeg 可执行文件路径（优先检查应用目录便携版，其次检查系统 PATH）"""
     # 1. 检查当前目录及同级目录是否存在 portable ffmpeg.exe
-    base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    if getattr(sys, 'frozen', False):
+        base_dir = os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
     local_candidates = [
         os.path.join(base_dir, "ffmpeg.exe"),
         os.path.join(base_dir, "bin", "ffmpeg.exe"),
         os.path.join(base_dir, "resources", "ffmpeg.exe"),
+        os.path.join(base_dir, "_internal", "resources", "ffmpeg.exe"),
     ]
+    if getattr(sys, 'frozen', False):
+        meipass = getattr(sys, '_MEIPASS', '')
+        if meipass:
+            local_candidates.append(os.path.join(meipass, "resources", "ffmpeg.exe"))
     for candidate in local_candidates:
         if os.path.exists(candidate) and os.path.isfile(candidate):
             return candidate
