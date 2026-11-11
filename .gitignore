@@ -1,0 +1,35 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local user config & history
+config.json
+*.json.bak
+
+# Local media downloads & temp files
+downloads/
+*.mp4
+*.m4a
+*.tmp*
+*.jpg
+*.png
+
+# Packaging & Build outputs
+build/
+dist/
+*.spec
+*.exe
+
+# IDE / Editor configs
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS generated files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
