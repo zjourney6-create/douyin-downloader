@@ -3,17 +3,55 @@ import subprocess
 from PySide6.QtCore import Qt, QSize
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QScrollArea, QFrame
+    QWidget, QVBoxLayout, QHBoxLayout, QScrollArea, QFrame, QDialog
 )
 from qfluentwidgets import (
     TitleLabel, SubtitleLabel, BodyLabel, CaptionLabel, StrongBodyLabel,
-    PrimaryPushButton, PushButton, TransparentToolButton,
+    PrimaryPushButton, PushButton, TransparentToolButton, RadioButton,
     TextEdit, ProgressBar, SimpleCardWidget, InfoBar, InfoBarPosition,
-    FluentIcon as FIF
+    MessageBoxBase, FluentIcon as FIF
 )
 
 from app.config import config
 from app.core.task_manager import DownloadTaskManager
+from app.engine.parser import DouyinParser
+
+class AuthorBatchDialog(MessageBoxBase):
+    """博主批量下载规模选择弹窗"""
+    def __init__(self, user_url: str, parent=None):
+        super().__init__(parent)
+        self.user_url = user_url
+        self.selected_count = 100
+
+        self.titleLabel = SubtitleLabel("检测到博主主页链接", self)
+        self.descLabel = CaptionLabel("您正在添加博主主页，支持一键批量抓取下载该博主的作品列表：", self)
+        self.descLabel.setTextColor("#8c8c8c", "#8c8c8c")
+
+        # 选项组
+        self.radio_100 = RadioButton("下载前 100 个视频 (推荐)", self)
+        self.radio_100.setChecked(True)
+        self.radio_200 = RadioButton("下载前 200 个视频", self)
+        self.radio_300 = RadioButton("下载前 300 个视频", self)
+
+        self.viewLayout.addWidget(self.titleLabel)
+        self.viewLayout.addWidget(self.descLabel)
+        self.viewLayout.addSpacing(10)
+        self.viewLayout.addWidget(self.radio_100)
+        self.viewLayout.addWidget(self.radio_200)
+        self.viewLayout.addWidget(self.radio_300)
+
+        self.yesButton.setText("开始批量抓取")
+        self.cancelButton.setText("取消")
+
+        self.yesButton.clicked.connect(self._on_confirm)
+
+    def _on_confirm(self):
+        if self.radio_100.isChecked():
+            self.selected_count = 100
+        elif self.radio_200.isChecked():
+            self.selected_count = 200
+        elif self.radio_300.isChecked():
+            self.selected_count = 300
 
 class TaskItemCard(SimpleCardWidget):
     """单个下载任务的卡片项"""
@@ -72,7 +110,7 @@ class TaskItemCard(SimpleCardWidget):
     def mark_completed(self, output_path: str):
         self.output_path = output_path
         self.progress_bar.setValue(100)
-        self.status_label.setText("✅ 下载合成完毕（H.265/AAC 原流）")
+        self.status_label.setText("✅ 下载完成（原流纯净无水印）")
         self.status_label.setTextColor("#52c41a", "#52c41a")
         self.btn_open.setVisible(True)
         self.btn_play.setVisible(True)
@@ -121,11 +159,11 @@ class DownloadView(QWidget):
         input_layout.setContentsMargins(18, 16, 18, 16)
         input_layout.setSpacing(12)
 
-        input_title = SubtitleLabel("添加视频链接", input_card)
+        input_title = SubtitleLabel("添加视频或博主主页链接", input_card)
         input_layout.addWidget(input_title)
 
         self.text_input = TextEdit(input_card)
-        self.text_input.setPlaceholderText("在此粘贴抖音分享口令或网址，支持多行批量输入，例如：\nhttps://v.douyin.com/-VB502OwYzk/\nhttps://www.douyin.com/jingxuan?modal_id=7687632073955314970")
+        self.text_input.setPlaceholderText("在此粘贴抖音分享口令、视频网址或博主主页，例如：\n• 单视频/带货：https://v.douyin.com/2j45DyIqAns/\n• 博主主页批量：https://www.douyin.com/user/MS4wLjABAAAA...")
         self.text_input.setFixedHeight(95)
         input_layout.addWidget(self.text_input)
 
@@ -140,7 +178,7 @@ class DownloadView(QWidget):
 
         btn_row.addStretch(1)
 
-        self.btn_download = PrimaryPushButton(FIF.DOWNLOAD, "开始下载原流", input_card)
+        self.btn_download = PrimaryPushButton(FIF.DOWNLOAD, "开始解析下载", input_card)
         self.btn_download.setFixedWidth(140)
         self.btn_download.clicked.connect(self._on_download_clicked)
         btn_row.addWidget(self.btn_download)
@@ -177,12 +215,15 @@ class DownloadView(QWidget):
         signals.sig_finished.connect(self._on_task_finished)
         signals.sig_error.connect(self._on_task_error)
 
+        signals.sig_author_fetch_progress.connect(self._on_author_fetch_progress)
+        signals.sig_author_fetch_done.connect(self._on_author_fetch_done)
+        signals.sig_author_fetch_error.connect(self._on_author_fetch_error)
+
     def fill_and_prompt(self, text: str):
-        """外部（如剪贴板监听器）注入链接并提示"""
         self.text_input.setPlainText(text)
         InfoBar.info(
             title="已捕捉到抖音链接",
-            content="检测到您复制了抖音分享链接，已自动填充，点击「开始下载」即可执行！",
+            content="检测到您复制了抖音链接，已自动填充，点击「开始解析下载」即可！",
             position=InfoBarPosition.TOP_RIGHT,
             duration=4000,
             parent=self
@@ -200,13 +241,31 @@ class DownloadView(QWidget):
         if not raw_text:
             InfoBar.warning(
                 title="请输入链接",
-                content="输入框为空，请先粘贴抖音视频链接后再点击下载。",
+                content="输入框为空，请先粘贴抖音视频或博主主页链接。",
                 position=InfoBarPosition.TOP_RIGHT,
                 duration=3000,
                 parent=self
             )
             return
 
+        # 判断是否为博主主页链接
+        if DouyinParser.is_user_homepage(raw_text):
+            extracted_url = DouyinParser.extract_url(raw_text) or raw_text
+            dialog = AuthorBatchDialog(extracted_url, self.window())
+            if dialog.exec():
+                count = dialog.selected_count
+                InfoBar.info(
+                    title="正在抓取博主作品",
+                    content=f"已开始扫描该博主主页（抓取前 {count} 个视频），请稍候...",
+                    position=InfoBarPosition.TOP_RIGHT,
+                    duration=5000,
+                    parent=self
+                )
+                DownloadTaskManager.instance().submit_author_fetch(extracted_url, max_count=count)
+                self.text_input.clear()
+            return
+
+        # 普通单视频或批量多行链接
         lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
         manager = DownloadTaskManager.instance()
 
@@ -214,7 +273,6 @@ class DownloadView(QWidget):
             task_id = manager.submit_task(line)
             card = TaskItemCard(task_id, f"正在准备解析: {line[:40]}...", self.tasks_container)
             self.task_cards[task_id] = card
-            # 插入到顶部
             self.tasks_layout.insertWidget(0, card)
 
         self.text_input.clear()
@@ -223,6 +281,44 @@ class DownloadView(QWidget):
             content=f"已成功添加 {len(lines)} 个下载任务到后台队列中！",
             position=InfoBarPosition.TOP_RIGHT,
             duration=3000,
+            parent=self
+        )
+
+    def _on_author_fetch_progress(self, msg: str):
+        InfoBar.info(
+            title="博主作品抓取进度",
+            content=msg,
+            position=InfoBarPosition.TOP_RIGHT,
+            duration=2500,
+            parent=self
+        )
+
+    def _on_author_fetch_done(self, author_name: str, video_list: list, author_dir: str):
+        manager = DownloadTaskManager.instance()
+        count = len(video_list)
+
+        for item in video_list:
+            v_url = item.get("url")
+            v_title = item.get("title")
+            task_id = manager.submit_task(v_url, custom_output_dir=author_dir)
+            card = TaskItemCard(task_id, f"[{author_name}] {v_title}", self.tasks_container)
+            self.task_cards[task_id] = card
+            self.tasks_layout.insertWidget(0, card)
+
+        InfoBar.success(
+            title="批量抓取完成",
+            content=f"已成功为博主【{author_name}】载入 {count} 个视频下载任务！文件将归档至专属文件夹。",
+            position=InfoBarPosition.BOTTOM_RIGHT,
+            duration=6000,
+            parent=self
+        )
+
+    def _on_author_fetch_error(self, err: str):
+        InfoBar.error(
+            title="博主主页抓取失败",
+            content=err,
+            position=InfoBarPosition.BOTTOM_RIGHT,
+            duration=5000,
             parent=self
         )
 
@@ -237,13 +333,6 @@ class DownloadView(QWidget):
     def _on_task_finished(self, task_id: str, output_path: str):
         if task_id in self.task_cards:
             self.task_cards[task_id].mark_completed(output_path)
-            InfoBar.success(
-                title="下载完成",
-                content=f"视频已保存至: {os.path.basename(output_path)}",
-                position=InfoBarPosition.BOTTOM_RIGHT,
-                duration=4000,
-                parent=self
-            )
 
     def _on_task_error(self, task_id: str, err_msg: str):
         if task_id in self.task_cards:

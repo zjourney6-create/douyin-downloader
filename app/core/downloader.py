@@ -9,7 +9,7 @@ from app.utils.file_helper import sanitize_filename, format_bytes
 from app.utils.ffmpeg_helper import merge_video_audio
 
 class VideoDownloader:
-    """抖音视频原流下载与无损合成执行器（自适应单流一体与DASH分流模式）"""
+    """抖音视频原流下载与无损合成执行器（自适应单流一体与DASH分流模式，支持自定义子目录归档）"""
 
     def __init__(self, info: ParsedVideoInfo, output_dir: Optional[str] = None):
         self.info = info
@@ -31,13 +31,11 @@ class VideoDownloader:
         final_filename = f"{safe_title}.mp4"
         final_path = os.path.join(self.output_dir, final_filename)
 
-        # 避免重名覆盖
-        counter = 1
-        base_name = safe_title
-        while os.path.exists(final_path):
-            final_filename = f"{base_name}_{counter}.mp4"
-            final_path = os.path.join(self.output_dir, final_filename)
-            counter += 1
+        # 智能防重跳过机制：如果本地已经存在且大于 100KB，直接跳过免重复下载
+        if os.path.exists(final_path) and os.path.getsize(final_path) > 100 * 1024:
+            size_str = format_bytes(os.path.getsize(final_path))
+            update_progress(100, f"✅ 本地已存在该视频，智能跳过 ({size_str})")
+            return final_path
 
         s = requests.Session()
         s.trust_env = False
@@ -47,7 +45,7 @@ class VideoDownloader:
         }
 
         # ----------------------------------------------------
-        # 分支 1：单流一体视频（如带货视频、普通 MP4 推流，音画已天然合一）
+        # 分支 1：单流一体视频（如带货视频、普通 MP4 推流）
         # ----------------------------------------------------
         if self.info.is_single_stream or not self.info.audio_url:
             update_progress(10, "检测为原生完整单流，正在直接高速下载...")
@@ -70,7 +68,6 @@ class VideoDownloader:
                                 p = 10 + int((downloaded / total_bytes) * 88)
                                 update_progress(p, f"正在下载原流: {format_bytes(downloaded)} / {format_bytes(total_bytes)}")
 
-                # 重命名临时文件为最终文件
                 if os.path.exists(final_path):
                     os.remove(final_path)
                 os.rename(temp_path, final_path)
@@ -78,7 +75,6 @@ class VideoDownloader:
                 file_size = os.path.getsize(final_path)
                 update_progress(100, f"下载完成！文件大小: {format_bytes(file_size)}")
 
-                # 记录历史
                 config.add_history({
                     "title": self.info.title,
                     "file_path": final_path,
@@ -98,13 +94,12 @@ class VideoDownloader:
                         pass
 
         # ----------------------------------------------------
-        # 分支 2：DASH 分流视频（音画独立，需下载后执行 FFmpeg 无损合并）
+        # 分支 2：DASH 分流视频（音画独立）
         # ----------------------------------------------------
         temp_video_path = os.path.join(self.output_dir, f".tmp_{self.info.video_id}_video.mp4")
         temp_audio_path = os.path.join(self.output_dir, f".tmp_{self.info.video_id}_audio.mp4")
 
         try:
-            # 1. 下载视频轨 (10% -> 70%)
             update_progress(10, "检测为分流视频，正在下载官方画轨...")
             resp_v = s.get(self.info.video_url, headers=headers, stream=True, timeout=20)
             resp_v.raise_for_status()
@@ -122,7 +117,6 @@ class VideoDownloader:
                             p = 10 + int((downloaded_v / total_v) * 60)
                             update_progress(p, f"正在下载画轨: {format_bytes(downloaded_v)} / {format_bytes(total_v)}")
 
-            # 2. 下载音频轨 (70% -> 90%)
             update_progress(70, "正在下载原始 AAC 高清音轨...")
             resp_a = s.get(self.info.audio_url, headers=headers, stream=True, timeout=20)
             resp_a.raise_for_status()
@@ -140,14 +134,12 @@ class VideoDownloader:
                             p = 70 + int((downloaded_a / total_a) * 20)
                             update_progress(p, f"正在下载音轨: {format_bytes(downloaded_a)} / {format_bytes(total_a)}")
 
-            # 3. FFmpeg 无损合并 (90% -> 99%)
             update_progress(92, "正在执行 FFmpeg 原流无损封装合成...")
             merge_video_audio(temp_video_path, temp_audio_path, final_path)
 
             file_size = os.path.getsize(final_path)
             update_progress(100, f"下载完成！文件大小: {format_bytes(file_size)}")
 
-            # 4. 记录历史
             config.add_history({
                 "title": self.info.title,
                 "file_path": final_path,
