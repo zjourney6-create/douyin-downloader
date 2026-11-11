@@ -1,13 +1,18 @@
 import os
 import re
+import json
+import time
 import requests
 from dataclasses import dataclass
 from typing import Optional, Tuple, List, Dict, Any
 from playwright.sync_api import sync_playwright
 
 from app.config import BASE_DIR
+from app.utils.browser_helper import get_best_browser_channel
 
 BROWSER_PROFILE_DIR = os.path.join(BASE_DIR, "browser_profile")
+STORAGE_STATE_FILE = os.path.join(BASE_DIR, "storage_state.json")
+DEFAULT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 @dataclass
 class ParsedVideoInfo:
@@ -25,26 +30,103 @@ class DouyinParser:
 
     @classmethod
     def get_browser_context(cls, p, headless: bool = True):
-        """获取持久化浏览器上下文（共享登录凭证 Cookies 与 LocalStorage）"""
-        os.makedirs(BROWSER_PROFILE_DIR, exist_ok=True)
-        return p.chromium.launch_persistent_context(
-            user_data_dir=BROWSER_PROFILE_DIR,
-            channel="msedge",
-            headless=headless,
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 800}
-        )
+        """
+        获取独立的轻量浏览器上下文，加载已保存的登录凭证
+        使用 new_context 彻底摆脱 user-data-dir 锁占用冲突（杜绝 exitCode 21）
+        自动匹配系统可用浏览器（Edge -> Chrome -> 自下载绿色Chromium）
+        """
+        channel = get_best_browser_channel(p)
+        launch_kwargs = {
+            "headless": headless,
+            "args": ["--disable-blink-features=AutomationControlled"]
+        }
+        if channel:
+            launch_kwargs["channel"] = channel
+
+        browser = p.chromium.launch(**launch_kwargs)
+        kwargs = {
+            "user_agent": DEFAULT_UA,
+            "viewport": {"width": 1280, "height": 800}
+        }
+        if os.path.exists(STORAGE_STATE_FILE):
+            try:
+                kwargs["storage_state"] = STORAGE_STATE_FILE
+            except Exception:
+                pass
+        context = browser.new_context(**kwargs)
+        # 将 browser 引用挂载到 context 上，便于 context.close() 时一同关闭 browser
+        context._parent_browser = browser
+        return context
+
+    @classmethod
+    def safe_close_context(cls, context):
+        """安全关闭上下文及底层浏览器进程"""
+        try:
+            context.close()
+        except Exception:
+            pass
+        if hasattr(context, "_parent_browser") and context._parent_browser:
+            try:
+                context._parent_browser.close()
+            except Exception:
+                pass
 
     @classmethod
     def open_login_window(cls):
-        """弹出可视化的 Edge 浏览器窗口供用户扫码登录抖音"""
+        """
+        弹出可视化的 Edge 浏览器窗口供用户扫码登录抖音
+        支持秒级响应窗口关闭，并在关闭/登录完成时自动提取 Cookie 凭证落盘
+        """
+        os.makedirs(BROWSER_PROFILE_DIR, exist_ok=True)
+        # 尝试清理旧残留锁文件（若进程已不在但遗留了锁）
+        for lock_name in ["LOCK", os.path.join("Default", "LOCK")]:
+            lock_path = os.path.join(BROWSER_PROFILE_DIR, lock_name)
+            if os.path.exists(lock_path):
+                try:
+                    os.remove(lock_path)
+                except Exception:
+                    pass
+
         with sync_playwright() as p:
-            context = cls.get_browser_context(p, headless=False)
-            page = context.new_page()
-            page.goto("https://www.douyin.com", wait_until="domcontentloaded")
-            # 保持窗口打开，直到用户手动关闭浏览器窗口
+            channel = get_best_browser_channel(p)
+            context_kwargs = {
+                "user_data_dir": BROWSER_PROFILE_DIR,
+                "headless": False,
+                "user_agent": DEFAULT_UA,
+                "viewport": {"width": 1280, "height": 800},
+                "args": ["--disable-blink-features=AutomationControlled"]
+            }
+            if channel:
+                context_kwargs["channel"] = channel
+
+            # 登录界面使用持久化模式记录会话
+            context = p.chromium.launch_persistent_context(**context_kwargs)
+            page = context.pages[0] if context.pages else context.new_page()
             try:
-                page.wait_for_timeout(300000)  # 最多等待 5 分钟
+                page.goto("https://www.douyin.com", wait_until="domcontentloaded")
+            except Exception:
+                pass
+
+            # 智能轮询：只要用户手动关闭了窗口，0.5 秒内立即释放资源，绝不傻等 5 分钟！
+            start_time = time.time()
+            max_wait_seconds = 300  # 最多等待 5 分钟
+
+            while time.time() - start_time < max_wait_seconds:
+                # 检查所有页面是否均已关闭
+                if not context.pages or all(p.is_closed() for p in context.pages):
+                    break
+
+                try:
+                    # 尝试导出保存最新的 Cookies 与 LocalStorage
+                    context.storage_state(path=STORAGE_STATE_FILE)
+                except Exception:
+                    pass
+
+                time.sleep(0.5)
+
+            # 最终导出凭证并彻底关闭释放 Edge 锁
+            try:
+                context.storage_state(path=STORAGE_STATE_FILE)
             except Exception:
                 pass
             finally:
@@ -137,7 +219,7 @@ class DouyinParser:
                 raw_title = page.title() or ""
                 title = re.sub(r'\s*-\s*抖音$', '', raw_title).strip()
             finally:
-                context.close()
+                cls.safe_close_context(context)
 
         if dash_video_url and dash_audio_url:
             return title or "抖音视频", dash_video_url, dash_audio_url, False
@@ -263,16 +345,28 @@ class DouyinParser:
             # 3. 循环自然滚动翻页，并在遇登录遮罩时自动清理拦截
             no_new_counter = 0
             scroll_count = 0
-            max_scrolls = max(25, (max_count // 8) + 15)
+            max_scrolls = max(40, (max_count // 6) + 30)
+
+            # 移动鼠标至右侧内容区域，确保滚轮聚焦在真正的滚动容器上
+            try:
+                page.mouse.move(700, 500)
+            except Exception:
+                pass
 
             while len(collected_list) < max_count and scroll_count < max_scrolls:
                 prev_len = len(collected_list)
 
-                # 模拟滚轮与键盘 PageDown
-                page.mouse.wheel(0, 1800)
-                page.wait_for_timeout(1000)
+                # 驱动抖音专属组件内部容器滚动
+                page.evaluate('''() => {
+                    const containers = document.querySelectorAll('.route-scroll-container, [class*="route-scroll"], [class*="llbV_Rqp"]');
+                    containers.forEach(c => {
+                        c.scrollTop = c.scrollHeight;
+                    });
+                    window.scrollTo(0, document.body.scrollHeight);
+                }''')
+                page.mouse.wheel(0, 3000)
                 page.keyboard.press("PageDown")
-                page.wait_for_timeout(1200)
+                page.wait_for_timeout(1500)
 
                 # 尝试关闭可能弹出的登录或提示遮罩
                 try:
@@ -302,7 +396,7 @@ class DouyinParser:
                     log_msg(f"已捕获 {min(curr_len, max_count)} / {max_count} 个作品...")
                 else:
                     no_new_counter += 1
-                    if no_new_counter >= 5:
+                    if no_new_counter >= 7:
                         # 再次尝试从 DOM 兜底扫描
                         latest_dom = page.evaluate('''() => {
                             return Array.from(document.querySelectorAll('a[href*="/video/"]'))
@@ -327,7 +421,7 @@ class DouyinParser:
                         log_msg(f"翻页完成（已达上限或全部加载完毕），共计获取 {len(collected_list)} 个纯净作品")
                         break
 
-            context.close()
+            cls.safe_close_context(context)
 
         final_list = collected_list[:max_count]
         return author_name, final_list

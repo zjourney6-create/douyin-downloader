@@ -7,6 +7,7 @@ __pycache__/
 config.json
 *.json.bak
 browser_profile/
+storage_state.json
 
 # Local media downloads & temp files
 downloads/
