@@ -37,15 +37,38 @@ class VideoDownloader:
                 progress_callback(val, text)
 
         os.makedirs(self.output_dir, exist_ok=True)
-        safe_title = sanitize_filename(self.info.title)
-        final_filename = f"{safe_title}.mp4"
-        final_path = os.path.join(self.output_dir, final_filename)
+        safe_title = sanitize_filename(self.info.title) or "抖音视频"
 
-        # 智能防重跳过机制
-        if os.path.exists(final_path) and os.path.getsize(final_path) > 100 * 1024:
+        # 1. 严格检查是否为同一个视频 ID（真正的历史防重）
+        is_already_downloaded = False
+        final_path = ""
+        for h in config.history:
+            if self.info.video_id and h.get("video_id") == self.info.video_id:
+                recorded_path = h.get("file_path", "")
+                if recorded_path and os.path.exists(recorded_path) and os.path.getsize(recorded_path) > 100 * 1024:
+                    final_path = recorded_path
+                    is_already_downloaded = True
+                    break
+
+        if is_already_downloaded:
             size_str = format_bytes(os.path.getsize(final_path))
             update_progress(100, f"✅ 本地已存在该视频，智能跳过 ({size_str})")
             return final_path
+
+        # 2. 如果是不同视频但标题重名（电商博主高频出现），自动追加 ID 或序号，绝不漏下任何作品
+        final_filename = f"{safe_title}.mp4"
+        final_path = os.path.join(self.output_dir, final_filename)
+
+        if os.path.exists(final_path):
+            short_suffix = f"_{self.info.video_id[-6:]}" if self.info.video_id else "_1"
+            final_filename = f"{safe_title}{short_suffix}.mp4"
+            final_path = os.path.join(self.output_dir, final_filename)
+
+            counter = 1
+            while os.path.exists(final_path):
+                final_filename = f"{safe_title}_{counter}.mp4"
+                final_path = os.path.join(self.output_dir, final_filename)
+                counter += 1
 
         s = requests.Session()
         s.trust_env = False

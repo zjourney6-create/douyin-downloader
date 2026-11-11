@@ -55,11 +55,14 @@ class AuthorBatchDialog(MessageBoxBase):
 
 class TaskItemCard(SimpleCardWidget):
     """单个下载任务的卡片项（支持动态取消、打开、重试）"""
-    def __init__(self, task_id: str, raw_url: str, initial_text: str, custom_output_dir: str = "", parent=None):
+    def __init__(self, task_id: str, raw_url: str, initial_text: str, custom_output_dir: str = "",
+                 direct_video_url: str = "", video_title: str = "", parent=None):
         super().__init__(parent)
         self.task_id = task_id
         self.raw_url = raw_url
         self.custom_output_dir = custom_output_dir
+        self.direct_video_url = direct_video_url
+        self.video_title = video_title
         self.output_path = ""
         self.is_completed = False
         self.is_cancelled = False
@@ -132,7 +135,12 @@ class TaskItemCard(SimpleCardWidget):
         self.status_label.setText("正在重新启动下载...")
         self.status_label.setTextColor("#8c8c8c", "#8c8c8c")
 
-        new_task_id = DownloadTaskManager.instance().submit_task(self.raw_url, custom_output_dir=self.custom_output_dir)
+        new_task_id = DownloadTaskManager.instance().submit_task(
+            self.raw_url,
+            custom_output_dir=self.custom_output_dir,
+            direct_video_url=self.direct_video_url,
+            video_title=self.video_title
+        )
         # 通知父级替换绑定
         if self.parent() and hasattr(self.parent(), "remap_card_id"):
             self.parent().remap_card_id(self.task_id, new_task_id)
@@ -374,8 +382,20 @@ class DownloadView(QWidget):
         for item in video_list:
             v_url = item.get("url")
             v_title = item.get("title")
-            task_id = manager.submit_task(v_url, custom_output_dir=author_dir)
-            card = TaskItemCard(task_id, v_url, f"[{author_name}] {v_title}", custom_output_dir=author_dir, parent=self)
+            v_direct_url = item.get("direct_video_url", "")
+            task_id = manager.submit_task(
+                v_url,
+                custom_output_dir=author_dir,
+                direct_video_url=v_direct_url,
+                video_title=v_title
+            )
+            card = TaskItemCard(
+                task_id, v_url, f"[{author_name}] {v_title}",
+                custom_output_dir=author_dir,
+                direct_video_url=v_direct_url,
+                video_title=v_title,
+                parent=self
+            )
             self.task_cards[task_id] = card
             self.tasks_layout.insertWidget(0, card)
 

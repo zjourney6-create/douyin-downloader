@@ -21,12 +21,17 @@ class TaskSignals(QObject):
     sig_author_fetch_error = Signal(str)              # error_message
 
 class DownloadWorker(QRunnable):
-    def __init__(self, task_id: str, raw_input: str, signals: TaskSignals, custom_output_dir: Optional[str] = None):
+    def __init__(self, task_id: str, raw_input: str, signals: TaskSignals,
+                 custom_output_dir: Optional[str] = None,
+                 direct_video_url: Optional[str] = None,
+                 video_title: Optional[str] = None):
         super().__init__()
         self.task_id = task_id
         self.raw_input = raw_input
         self.signals = signals
         self.custom_output_dir = custom_output_dir
+        self.direct_video_url = direct_video_url
+        self.video_title = video_title
         self.downloader: Optional[VideoDownloader] = None
         self.is_cancelled = False
 
@@ -41,17 +46,32 @@ class DownloadWorker(QRunnable):
                 self.signals.sig_cancelled.emit(self.task_id)
                 return
 
-            self.signals.sig_started.emit(self.task_id, "正在解析链接...")
-            self.signals.sig_progress.emit(self.task_id, 3, "正在唤起自愈嗅探引擎...")
+            if self.direct_video_url:
+                # 官方直链直通车：无需唤起无头浏览器，0 秒秒级解析，100% 避开任何前端滑块风控！
+                title = self.video_title or "抖音视频"
+                self.signals.sig_started.emit(self.task_id, title)
+                self.signals.sig_progress.emit(self.task_id, 10, "已直接获取最高清原画流，正在极速下载...")
 
-            # 1. 嗅探提取音视频流
-            info: ParsedVideoInfo = DouyinParser.parse(self.raw_input)
-            if self.is_cancelled:
-                self.signals.sig_cancelled.emit(self.task_id)
-                return
+                info = ParsedVideoInfo(
+                    video_id=self.task_id,
+                    title=title,
+                    video_url=self.direct_video_url,
+                    audio_url="",
+                    share_url=self.raw_input,
+                    is_single_stream=True
+                )
+            else:
+                self.signals.sig_started.emit(self.task_id, "正在解析链接...")
+                self.signals.sig_progress.emit(self.task_id, 3, "正在唤起自愈嗅探引擎...")
 
-            self.signals.sig_started.emit(self.task_id, info.title)
-            self.signals.sig_progress.emit(self.task_id, 10, "流地址解析成功，准备下载...")
+                # 1. 嗅探提取音视频流
+                info: ParsedVideoInfo = DouyinParser.parse(self.raw_input)
+                if self.is_cancelled:
+                    self.signals.sig_cancelled.emit(self.task_id)
+                    return
+
+                self.signals.sig_started.emit(self.task_id, info.title)
+                self.signals.sig_progress.emit(self.task_id, 10, "流地址解析成功，准备下载...")
 
             # 2. 下载并合并
             self.downloader = VideoDownloader(info, output_dir=self.custom_output_dir)
@@ -119,9 +139,15 @@ class DownloadTaskManager(QObject):
             cls._instance = DownloadTaskManager()
         return cls._instance
 
-    def submit_task(self, raw_input: str, custom_output_dir: Optional[str] = None) -> str:
+    def submit_task(self, raw_input: str, custom_output_dir: Optional[str] = None,
+                    direct_video_url: Optional[str] = None, video_title: Optional[str] = None) -> str:
         task_id = str(uuid.uuid4())[:8]
-        worker = DownloadWorker(task_id, raw_input, self.signals, custom_output_dir=custom_output_dir)
+        worker = DownloadWorker(
+            task_id, raw_input, self.signals,
+            custom_output_dir=custom_output_dir,
+            direct_video_url=direct_video_url,
+            video_title=video_title
+        )
         self.active_tasks[task_id] = worker
         self.thread_pool.start(worker)
         return task_id

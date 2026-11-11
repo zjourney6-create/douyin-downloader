@@ -279,10 +279,25 @@ class DouyinParser:
                             if aweme_id and aweme_id not in seen_ids:
                                 seen_ids.add(aweme_id)
                                 desc = item.get("desc") or f"视频_{aweme_id}"
+
+                                # 提取官方原生最高清播放直链（直通车，无需再开启无头浏览器嗅探）
+                                video_obj = item.get("video", {})
+                                play_addr = video_obj.get("play_addr", {})
+                                url_list = play_addr.get("url_list", [])
+                                direct_url = url_list[0] if url_list else ""
+
+                                bit_rates = video_obj.get("bit_rate", [])
+                                if bit_rates:
+                                    best_br = max(bit_rates, key=lambda b: b.get("bit_rate", 0))
+                                    br_urls = best_br.get("play_addr", {}).get("url_list", [])
+                                    if br_urls:
+                                        direct_url = br_urls[0]
+
                                 collected_list.append({
                                     "id": aweme_id,
                                     "title": desc.strip(),
-                                    "url": f"https://www.douyin.com/video/{aweme_id}"
+                                    "url": f"https://www.douyin.com/video/{aweme_id}",
+                                    "direct_video_url": direct_url
                                 })
                     except Exception:
                         pass

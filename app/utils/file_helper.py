@@ -3,10 +3,12 @@ import os
 
 def sanitize_filename(filename: str, max_length: int = 120) -> str:
     """清理文件名中的非法字符，避免在 Windows 磁盘写入失败"""
+    # 过滤控制字符与换行符
+    cleaned = re.sub(r'[\r\n\t]+', ' ', filename)
     # 替换 Windows 文件名禁用字符: \ / : * ? " < > |
-    cleaned = re.sub(r'[\\/*?:"<>|]', '_', filename)
-    # 去除首尾空格和换行
-    cleaned = cleaned.strip()
+    cleaned = re.sub(r'[\\/*?:"<>|]', '_', cleaned)
+    # 压缩连续空格
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
     # 避免名字过长
     if len(cleaned) > max_length:
         cleaned = cleaned[:max_length].strip()
