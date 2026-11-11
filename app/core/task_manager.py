@@ -13,6 +13,7 @@ class TaskSignals(QObject):
     sig_progress = Signal(str, int, str)  # task_id, progress (0-100), status_text
     sig_finished = Signal(str, str)       # task_id, output_path
     sig_error = Signal(str, str)          # task_id, error_text
+    sig_cancelled = Signal(str)           # task_id 取消成功
 
     # 博主批量抓取专用信号
     sig_author_fetch_progress = Signal(str)           # status_message
@@ -27,27 +28,56 @@ class DownloadWorker(QRunnable):
         self.signals = signals
         self.custom_output_dir = custom_output_dir
         self.downloader: Optional[VideoDownloader] = None
+        self.is_cancelled = False
+
+    def cancel(self):
+        self.is_cancelled = True
+        if self.downloader:
+            self.downloader.cancel()
 
     def run(self):
         try:
+            if self.is_cancelled:
+                self.signals.sig_cancelled.emit(self.task_id)
+                return
+
             self.signals.sig_started.emit(self.task_id, "正在解析链接...")
             self.signals.sig_progress.emit(self.task_id, 3, "正在唤起自愈嗅探引擎...")
 
             # 1. 嗅探提取音视频流
             info: ParsedVideoInfo = DouyinParser.parse(self.raw_input)
+            if self.is_cancelled:
+                self.signals.sig_cancelled.emit(self.task_id)
+                return
+
             self.signals.sig_started.emit(self.task_id, info.title)
             self.signals.sig_progress.emit(self.task_id, 10, "流地址解析成功，准备下载...")
 
             # 2. 下载并合并
             self.downloader = VideoDownloader(info, output_dir=self.custom_output_dir)
+            if self.is_cancelled:
+                self.downloader.cancel()
+                self.signals.sig_cancelled.emit(self.task_id)
+                return
+
             def on_progress(percent: int, msg: str):
-                self.signals.sig_progress.emit(self.task_id, percent, msg)
+                if not self.is_cancelled:
+                    self.signals.sig_progress.emit(self.task_id, percent, msg)
 
             output_path = self.downloader.download(progress_callback=on_progress)
-            self.signals.sig_finished.emit(self.task_id, output_path)
 
+            if self.is_cancelled:
+                self.signals.sig_cancelled.emit(self.task_id)
+            else:
+                self.signals.sig_finished.emit(self.task_id, output_path)
+
+        except InterruptedError:
+            self.signals.sig_cancelled.emit(self.task_id)
         except Exception as e:
-            self.signals.sig_error.emit(self.task_id, str(e))
+            if self.is_cancelled:
+                self.signals.sig_cancelled.emit(self.task_id)
+            else:
+                self.signals.sig_error.emit(self.task_id, str(e))
 
 class AuthorFetchWorker(QRunnable):
     """博主主页作品列表异步抓取器"""
@@ -65,7 +95,6 @@ class AuthorFetchWorker(QRunnable):
             author_name, video_list = DouyinParser.fetch_author_videos(
                 self.user_url, max_count=self.max_count, progress_cb=on_progress
             )
-            # 在 downloads/ 下创建博主独立专属子目录
             safe_author_dir = os.path.join(config.download_dir, sanitize_filename(author_name))
             os.makedirs(safe_author_dir, exist_ok=True)
 
@@ -96,6 +125,17 @@ class DownloadTaskManager(QObject):
         self.active_tasks[task_id] = worker
         self.thread_pool.start(worker)
         return task_id
+
+    def cancel_task(self, task_id: str):
+        """取消单个指定任务"""
+        if task_id in self.active_tasks:
+            worker = self.active_tasks[task_id]
+            worker.cancel()
+
+    def cancel_all(self):
+        """一键取消全部活跃任务"""
+        for task_id, worker in list(self.active_tasks.items()):
+            worker.cancel()
 
     def submit_author_fetch(self, user_url: str, max_count: int = 100):
         worker = AuthorFetchWorker(user_url, max_count, self.signals)

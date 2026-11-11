@@ -1,5 +1,6 @@
 import os
 import subprocess
+from typing import Dict
 from PySide6.QtCore import Qt, QSize
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
@@ -27,7 +28,6 @@ class AuthorBatchDialog(MessageBoxBase):
         self.descLabel = CaptionLabel("您正在添加博主主页，支持一键批量抓取下载该博主的作品列表：", self)
         self.descLabel.setTextColor("#8c8c8c", "#8c8c8c")
 
-        # 选项组
         self.radio_100 = RadioButton("下载前 100 个视频 (推荐)", self)
         self.radio_100.setChecked(True)
         self.radio_200 = RadioButton("下载前 200 个视频", self)
@@ -54,11 +54,15 @@ class AuthorBatchDialog(MessageBoxBase):
             self.selected_count = 300
 
 class TaskItemCard(SimpleCardWidget):
-    """单个下载任务的卡片项"""
-    def __init__(self, task_id: str, initial_text: str, parent=None):
+    """单个下载任务的卡片项（支持动态取消、打开、重试）"""
+    def __init__(self, task_id: str, raw_url: str, initial_text: str, custom_output_dir: str = "", parent=None):
         super().__init__(parent)
         self.task_id = task_id
+        self.raw_url = raw_url
+        self.custom_output_dir = custom_output_dir
         self.output_path = ""
+        self.is_completed = False
+        self.is_cancelled = False
         self.init_ui(initial_text)
 
     def init_ui(self, initial_text: str):
@@ -72,12 +76,27 @@ class TaskItemCard(SimpleCardWidget):
         self.title_label.setWordWrap(True)
         top_layout.addWidget(self.title_label, 1)
 
+        # 取消按钮（进行中时可见）
+        self.btn_cancel = TransparentToolButton(FIF.CLOSE, self)
+        self.btn_cancel.setToolTip("取消下载")
+        self.btn_cancel.clicked.connect(self._on_cancel_clicked)
+        top_layout.addWidget(self.btn_cancel)
+
+        # 重新下载按钮（取消后变为可见）
+        self.btn_retry = TransparentToolButton(FIF.SYNC, self)
+        self.btn_retry.setToolTip("重新下载该视频")
+        self.btn_retry.setVisible(False)
+        self.btn_retry.clicked.connect(self._on_retry_clicked)
+        top_layout.addWidget(self.btn_retry)
+
+        # 打开文件夹按钮（完成后可见）
         self.btn_open = TransparentToolButton(FIF.FOLDER, self)
         self.btn_open.setToolTip("打开所在文件夹")
         self.btn_open.setVisible(False)
         self.btn_open.clicked.connect(self._open_folder)
         top_layout.addWidget(self.btn_open)
 
+        # 播放视频按钮（完成后可见）
         self.btn_play = TransparentToolButton(FIF.PLAY, self)
         self.btn_play.setToolTip("立即播放视频")
         self.btn_play.setVisible(False)
@@ -100,32 +119,65 @@ class TaskItemCard(SimpleCardWidget):
 
         layout.addLayout(bottom_layout)
 
+    def _on_cancel_clicked(self):
+        DownloadTaskManager.instance().cancel_task(self.task_id)
+        self.mark_cancelled()
+
+    def _on_retry_clicked(self):
+        # 重新提交下载
+        self.btn_retry.setVisible(False)
+        self.btn_cancel.setVisible(True)
+        self.is_cancelled = False
+        self.progress_bar.setValue(5)
+        self.status_label.setText("正在重新启动下载...")
+        self.status_label.setTextColor("#8c8c8c", "#8c8c8c")
+
+        new_task_id = DownloadTaskManager.instance().submit_task(self.raw_url, custom_output_dir=self.custom_output_dir)
+        # 通知父级替换绑定
+        if self.parent() and hasattr(self.parent(), "remap_card_id"):
+            self.parent().remap_card_id(self.task_id, new_task_id)
+        self.task_id = new_task_id
+
     def update_title(self, title: str):
         self.title_label.setText(title)
 
     def update_progress(self, percent: int, msg: str):
-        self.progress_bar.setValue(percent)
-        self.status_label.setText(msg)
+        if not self.is_cancelled and not self.is_completed:
+            self.progress_bar.setValue(percent)
+            self.status_label.setText(msg)
 
     def mark_completed(self, output_path: str):
+        self.is_completed = True
         self.output_path = output_path
         self.progress_bar.setValue(100)
         self.status_label.setText("✅ 下载完成（原流纯净无水印）")
         self.status_label.setTextColor("#52c41a", "#52c41a")
+        self.btn_cancel.setVisible(False)
+        self.btn_retry.setVisible(False)
         self.btn_open.setVisible(True)
         self.btn_play.setVisible(True)
+
+    def mark_cancelled(self):
+        self.is_cancelled = True
+        self.progress_bar.setValue(0)
+        self.status_label.setText("⚠️ 已取消下载（已清理临时缓存）")
+        self.status_label.setTextColor("#faad14", "#faad14")
+        self.btn_cancel.setVisible(False)
+        self.btn_retry.setVisible(True)
 
     def mark_error(self, err_msg: str):
         self.progress_bar.setValue(0)
         self.status_label.setText(f"❌ 失败: {err_msg}")
         self.status_label.setTextColor("#ff4d4f", "#ff4d4f")
+        self.btn_cancel.setVisible(False)
+        self.btn_retry.setVisible(True)
 
     def _open_folder(self):
         if self.output_path and os.path.exists(self.output_path):
             folder = os.path.dirname(self.output_path)
             subprocess.Popen(f'explorer /select,"{os.path.normpath(self.output_path)}"')
         else:
-            folder = config.download_dir
+            folder = self.custom_output_dir or config.download_dir
             os.startfile(folder)
 
     def _play_video(self):
@@ -137,9 +189,14 @@ class DownloadView(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.task_cards = {}
+        self.task_cards: Dict[str, TaskItemCard] = {}
         self.init_ui()
         self._bind_signals()
+
+    def remap_card_id(self, old_id: str, new_id: str):
+        if old_id in self.task_cards:
+            card = self.task_cards.pop(old_id)
+            self.task_cards[new_id] = card
 
     def init_ui(self):
         main_layout = QVBoxLayout(self)
@@ -186,11 +243,16 @@ class DownloadView(QWidget):
         input_layout.addLayout(btn_row)
         main_layout.addWidget(input_card)
 
-        # 任务列表标题
+        # 任务列表标题与全局操作
         tasks_header = QHBoxLayout()
         task_label = SubtitleLabel("下载任务队列", self)
         tasks_header.addWidget(task_label)
         tasks_header.addStretch(1)
+
+        self.btn_cancel_all = PushButton(FIF.CLOSE, "全部取消", self)
+        self.btn_cancel_all.clicked.connect(self._on_cancel_all_clicked)
+        tasks_header.addWidget(self.btn_cancel_all)
+
         main_layout.addLayout(tasks_header)
 
         # 任务滚动区域
@@ -214,6 +276,7 @@ class DownloadView(QWidget):
         signals.sig_progress.connect(self._on_task_progress)
         signals.sig_finished.connect(self._on_task_finished)
         signals.sig_error.connect(self._on_task_error)
+        signals.sig_cancelled.connect(self._on_task_cancelled)
 
         signals.sig_author_fetch_progress.connect(self._on_author_fetch_progress)
         signals.sig_author_fetch_done.connect(self._on_author_fetch_done)
@@ -236,6 +299,19 @@ class DownloadView(QWidget):
             if text:
                 self.text_input.setPlainText(text.strip())
 
+    def _on_cancel_all_clicked(self):
+        DownloadTaskManager.instance().cancel_all()
+        for card in self.task_cards.values():
+            if not card.is_completed:
+                card.mark_cancelled()
+        InfoBar.warning(
+            title="已触发全部取消",
+            content="正在终止所有进行中的下载任务并释放网络资源...",
+            position=InfoBarPosition.TOP_RIGHT,
+            duration=3000,
+            parent=self
+        )
+
     def _on_download_clicked(self):
         raw_text = self.text_input.toPlainText().strip()
         if not raw_text:
@@ -248,7 +324,6 @@ class DownloadView(QWidget):
             )
             return
 
-        # 判断是否为博主主页链接
         if DouyinParser.is_user_homepage(raw_text):
             extracted_url = DouyinParser.extract_url(raw_text) or raw_text
             dialog = AuthorBatchDialog(extracted_url, self.window())
@@ -265,13 +340,12 @@ class DownloadView(QWidget):
                 self.text_input.clear()
             return
 
-        # 普通单视频或批量多行链接
         lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
         manager = DownloadTaskManager.instance()
 
         for line in lines:
             task_id = manager.submit_task(line)
-            card = TaskItemCard(task_id, f"正在准备解析: {line[:40]}...", self.tasks_container)
+            card = TaskItemCard(task_id, line, f"正在准备解析: {line[:40]}...", parent=self)
             self.task_cards[task_id] = card
             self.tasks_layout.insertWidget(0, card)
 
@@ -301,7 +375,7 @@ class DownloadView(QWidget):
             v_url = item.get("url")
             v_title = item.get("title")
             task_id = manager.submit_task(v_url, custom_output_dir=author_dir)
-            card = TaskItemCard(task_id, f"[{author_name}] {v_title}", self.tasks_container)
+            card = TaskItemCard(task_id, v_url, f"[{author_name}] {v_title}", custom_output_dir=author_dir, parent=self)
             self.task_cards[task_id] = card
             self.tasks_layout.insertWidget(0, card)
 
@@ -333,6 +407,10 @@ class DownloadView(QWidget):
     def _on_task_finished(self, task_id: str, output_path: str):
         if task_id in self.task_cards:
             self.task_cards[task_id].mark_completed(output_path)
+
+    def _on_task_cancelled(self, task_id: str):
+        if task_id in self.task_cards:
+            self.task_cards[task_id].mark_cancelled()
 
     def _on_task_error(self, task_id: str, err_msg: str):
         if task_id in self.task_cards:

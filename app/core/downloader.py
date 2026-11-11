@@ -9,12 +9,22 @@ from app.utils.file_helper import sanitize_filename, format_bytes
 from app.utils.ffmpeg_helper import merge_video_audio
 
 class VideoDownloader:
-    """抖音视频原流下载与无损合成执行器（自适应单流一体与DASH分流模式，支持自定义子目录归档）"""
+    """抖音视频原流下载与无损合成执行器（支持实时取消与临时碎片文件清理）"""
 
     def __init__(self, info: ParsedVideoInfo, output_dir: Optional[str] = None):
         self.info = info
         self.output_dir = output_dir or config.download_dir
         self.is_cancelled = False
+        self.active_resp: Optional[requests.Response] = None
+
+    def cancel(self):
+        """外部触发取消指令"""
+        self.is_cancelled = True
+        if self.active_resp:
+            try:
+                self.active_resp.close()
+            except Exception:
+                pass
 
     def download(self, progress_callback: Optional[Callable[[int, str], None]] = None) -> str:
         """
@@ -31,7 +41,7 @@ class VideoDownloader:
         final_filename = f"{safe_title}.mp4"
         final_path = os.path.join(self.output_dir, final_filename)
 
-        # 智能防重跳过机制：如果本地已经存在且大于 100KB，直接跳过免重复下载
+        # 智能防重跳过机制
         if os.path.exists(final_path) and os.path.getsize(final_path) > 100 * 1024:
             size_str = format_bytes(os.path.getsize(final_path))
             update_progress(100, f"✅ 本地已存在该视频，智能跳过 ({size_str})")
@@ -52,13 +62,13 @@ class VideoDownloader:
             temp_path = os.path.join(self.output_dir, f".tmp_{self.info.video_id}_full.mp4")
 
             try:
-                resp = s.get(self.info.video_url, headers=headers, stream=True, timeout=25)
-                resp.raise_for_status()
-                total_bytes = int(resp.headers.get("content-length", 0))
+                self.active_resp = s.get(self.info.video_url, headers=headers, stream=True, timeout=25)
+                self.active_resp.raise_for_status()
+                total_bytes = int(self.active_resp.headers.get("content-length", 0))
                 downloaded = 0
 
                 with open(temp_path, "wb") as f:
-                    for chunk in resp.iter_content(chunk_size=512 * 1024):
+                    for chunk in self.active_resp.iter_content(chunk_size=512 * 1024):
                         if self.is_cancelled:
                             raise InterruptedError("下载已被用户取消")
                         if chunk:
@@ -67,6 +77,9 @@ class VideoDownloader:
                             if total_bytes > 0:
                                 p = 10 + int((downloaded / total_bytes) * 88)
                                 update_progress(p, f"正在下载原流: {format_bytes(downloaded)} / {format_bytes(total_bytes)}")
+
+                if self.is_cancelled:
+                    raise InterruptedError("下载已被用户取消")
 
                 if os.path.exists(final_path):
                     os.remove(final_path)
@@ -101,13 +114,13 @@ class VideoDownloader:
 
         try:
             update_progress(10, "检测为分流视频，正在下载官方画轨...")
-            resp_v = s.get(self.info.video_url, headers=headers, stream=True, timeout=20)
-            resp_v.raise_for_status()
-            total_v = int(resp_v.headers.get("content-length", 0))
+            self.active_resp = s.get(self.info.video_url, headers=headers, stream=True, timeout=20)
+            self.active_resp.raise_for_status()
+            total_v = int(self.active_resp.headers.get("content-length", 0))
             downloaded_v = 0
 
             with open(temp_video_path, "wb") as f_v:
-                for chunk in resp_v.iter_content(chunk_size=512 * 1024):
+                for chunk in self.active_resp.iter_content(chunk_size=512 * 1024):
                     if self.is_cancelled:
                         raise InterruptedError("下载已被用户取消")
                     if chunk:
@@ -117,14 +130,17 @@ class VideoDownloader:
                             p = 10 + int((downloaded_v / total_v) * 60)
                             update_progress(p, f"正在下载画轨: {format_bytes(downloaded_v)} / {format_bytes(total_v)}")
 
+            if self.is_cancelled:
+                raise InterruptedError("下载已被用户取消")
+
             update_progress(70, "正在下载原始 AAC 高清音轨...")
-            resp_a = s.get(self.info.audio_url, headers=headers, stream=True, timeout=20)
-            resp_a.raise_for_status()
-            total_a = int(resp_a.headers.get("content-length", 0))
+            self.active_resp = s.get(self.info.audio_url, headers=headers, stream=True, timeout=20)
+            self.active_resp.raise_for_status()
+            total_a = int(self.active_resp.headers.get("content-length", 0))
             downloaded_a = 0
 
             with open(temp_audio_path, "wb") as f_a:
-                for chunk in resp_a.iter_content(chunk_size=256 * 1024):
+                for chunk in self.active_resp.iter_content(chunk_size=256 * 1024):
                     if self.is_cancelled:
                         raise InterruptedError("下载已被用户取消")
                     if chunk:
@@ -133,6 +149,9 @@ class VideoDownloader:
                         if total_a > 0:
                             p = 70 + int((downloaded_a / total_a) * 20)
                             update_progress(p, f"正在下载音轨: {format_bytes(downloaded_a)} / {format_bytes(total_a)}")
+
+            if self.is_cancelled:
+                raise InterruptedError("下载已被用户取消")
 
             update_progress(92, "正在执行 FFmpeg 原流无损封装合成...")
             merge_video_audio(temp_video_path, temp_audio_path, final_path)
@@ -159,6 +178,3 @@ class VideoDownloader:
                         os.remove(temp_f)
                     except Exception:
                         pass
-
-    def cancel(self):
-        self.is_cancelled = True
