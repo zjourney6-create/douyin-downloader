@@ -1,5 +1,4 @@
 import os
-import time
 import requests
 from typing import Callable, Optional
 from datetime import datetime
@@ -10,7 +9,7 @@ from app.utils.file_helper import sanitize_filename, format_bytes
 from app.utils.ffmpeg_helper import merge_video_audio
 
 class VideoDownloader:
-    """抖音视频原流下载与无损合成执行器"""
+    """抖音视频原流下载与无损合成执行器（自适应单流一体与DASH分流模式）"""
 
     def __init__(self, info: ParsedVideoInfo, output_dir: Optional[str] = None):
         self.info = info
@@ -19,9 +18,9 @@ class VideoDownloader:
 
     def download(self, progress_callback: Optional[Callable[[int, str], None]] = None) -> str:
         """
-        执行下载与合并主流程
+        执行下载主流程
         :param progress_callback: 回调函数 (progress: 0-100, status_text: str)
-        :return: 最终合并生成的文件路径
+        :return: 最终生成的文件路径
         """
         def update_progress(val: int, text: str):
             if progress_callback:
@@ -32,16 +31,13 @@ class VideoDownloader:
         final_filename = f"{safe_title}.mp4"
         final_path = os.path.join(self.output_dir, final_filename)
 
-        # 避免重名覆盖：如果文件已存在，增加后缀编号
+        # 避免重名覆盖
         counter = 1
         base_name = safe_title
         while os.path.exists(final_path):
             final_filename = f"{base_name}_{counter}.mp4"
             final_path = os.path.join(self.output_dir, final_filename)
             counter += 1
-
-        temp_video_path = os.path.join(self.output_dir, f".tmp_{self.info.video_id}_video.mp4")
-        temp_audio_path = os.path.join(self.output_dir, f".tmp_{self.info.video_id}_audio.mp4")
 
         s = requests.Session()
         s.trust_env = False
@@ -50,9 +46,66 @@ class VideoDownloader:
             "Referer": "https://www.douyin.com/"
         }
 
+        # ----------------------------------------------------
+        # 分支 1：单流一体视频（如带货视频、普通 MP4 推流，音画已天然合一）
+        # ----------------------------------------------------
+        if self.info.is_single_stream or not self.info.audio_url:
+            update_progress(10, "检测为原生完整单流，正在直接高速下载...")
+            temp_path = os.path.join(self.output_dir, f".tmp_{self.info.video_id}_full.mp4")
+
+            try:
+                resp = s.get(self.info.video_url, headers=headers, stream=True, timeout=25)
+                resp.raise_for_status()
+                total_bytes = int(resp.headers.get("content-length", 0))
+                downloaded = 0
+
+                with open(temp_path, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=512 * 1024):
+                        if self.is_cancelled:
+                            raise InterruptedError("下载已被用户取消")
+                        if chunk:
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            if total_bytes > 0:
+                                p = 10 + int((downloaded / total_bytes) * 88)
+                                update_progress(p, f"正在下载原流: {format_bytes(downloaded)} / {format_bytes(total_bytes)}")
+
+                # 重命名临时文件为最终文件
+                if os.path.exists(final_path):
+                    os.remove(final_path)
+                os.rename(temp_path, final_path)
+
+                file_size = os.path.getsize(final_path)
+                update_progress(100, f"下载完成！文件大小: {format_bytes(file_size)}")
+
+                # 记录历史
+                config.add_history({
+                    "title": self.info.title,
+                    "file_path": final_path,
+                    "file_size": file_size,
+                    "file_size_str": format_bytes(file_size),
+                    "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "share_url": self.info.share_url,
+                    "video_id": self.info.video_id
+                })
+
+                return final_path
+            finally:
+                if os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except Exception:
+                        pass
+
+        # ----------------------------------------------------
+        # 分支 2：DASH 分流视频（音画独立，需下载后执行 FFmpeg 无损合并）
+        # ----------------------------------------------------
+        temp_video_path = os.path.join(self.output_dir, f".tmp_{self.info.video_id}_video.mp4")
+        temp_audio_path = os.path.join(self.output_dir, f".tmp_{self.info.video_id}_audio.mp4")
+
         try:
             # 1. 下载视频轨 (10% -> 70%)
-            update_progress(10, "正在下载官方 H.265 原始画轨...")
+            update_progress(10, "检测为分流视频，正在下载官方画轨...")
             resp_v = s.get(self.info.video_url, headers=headers, stream=True, timeout=20)
             resp_v.raise_for_status()
             total_v = int(resp_v.headers.get("content-length", 0))
@@ -108,7 +161,6 @@ class VideoDownloader:
             return final_path
 
         finally:
-            # 清理临时文件
             for temp_f in [temp_video_path, temp_audio_path]:
                 if os.path.exists(temp_f):
                     try:

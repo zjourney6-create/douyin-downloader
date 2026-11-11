@@ -11,9 +11,10 @@ class ParsedVideoInfo:
     video_url: str
     audio_url: str
     share_url: str
+    is_single_stream: bool = False  # True 表示音画合一单流（如带货/电商视频），无需 FFmpeg 二次合成
 
 class DouyinParser:
-    """抖音视频混合自愈解析器"""
+    """抖音视频混合自愈解析器（支持普通分流视频与带货/短视频单流一体视频）"""
 
     URL_REGEX = re.compile(r'https?://[^\s，,。]+')
 
@@ -41,12 +42,10 @@ class DouyinParser:
 
         # 从最终长链接或 modal_id 提取 video_id
         video_id = ""
-        # 模式1: /video/7123456789...
         m1 = re.search(r'/video/(\d+)', final_url)
         if m1:
             video_id = m1.group(1)
         else:
-            # 模式2: modal_id=7123456789...
             m2 = re.search(r'modal_id=(\d+)', final_url)
             if m2:
                 video_id = m2.group(1)
@@ -55,19 +54,20 @@ class DouyinParser:
         return normalized_url, video_id
 
     @classmethod
-    def sniff_streams_via_edge(cls, target_url: str, timeout_sec: int = 25) -> Tuple[str, str, str]:
+    def sniff_streams_via_edge(cls, target_url: str, timeout_sec: int = 25) -> Tuple[str, str, str, bool]:
         """
         利用系统 Edge 内核后台无头嗅探获取：
         1. 视频标题
-        2. 官方原始 H.265 (media-video) CDN 直链
-        3. 官方原始 AAC (media-audio) CDN 直链
+        2. 视频流直链 (video_url)
+        3. 音频流直链 (audio_url，若为单流则为空字符串)
+        4. is_single_stream (是否为自带音频的完整MP4单流)
         """
-        video_url = ""
-        audio_url = ""
+        dash_video_url = ""
+        dash_audio_url = ""
+        single_media_url = ""
         title = ""
 
         with sync_playwright() as p:
-            # 使用 Windows 预装的 Edge 浏览器内核
             browser = p.chromium.launch(channel="msedge", headless=True)
             context = browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -75,34 +75,57 @@ class DouyinParser:
             page = context.new_page()
 
             def handle_request(req):
-                nonlocal video_url, audio_url
+                nonlocal dash_video_url, dash_audio_url, single_media_url
                 u = req.url
                 if "douyinvod.com" in u:
-                    if "media-video" in u and not video_url:
-                        video_url = u
-                    elif "media-audio" in u and not audio_url:
-                        audio_url = u
+                    if "media-video" in u and not dash_video_url:
+                        dash_video_url = u
+                    elif "media-audio" in u and not dash_audio_url:
+                        dash_audio_url = u
+                    elif not single_media_url and ("media-video" not in u and "media-audio" not in u):
+                        # 单流一体视频特征（如带货视频、普通 MP4 推流）
+                        single_media_url = u
 
             page.on("request", handle_request)
 
             try:
                 page.goto(target_url, wait_until="domcontentloaded", timeout=timeout_sec * 1000)
-                # 轮询等待音画两条流均被捕获
-                for _ in range(timeout_sec * 2):
-                    if video_url and audio_url:
+
+                # 轮询等待媒体捕获
+                for i in range(timeout_sec * 2):
+                    # 模式A：已捕获到分流的两条轨
+                    if dash_video_url and dash_audio_url:
                         break
+
+                    # 检查 DOM 中的 video 标签 src / currentSrc
+                    dom_src = page.evaluate('''() => {
+                        const v = document.querySelector('video');
+                        return v ? (v.currentSrc || v.src || '') : '';
+                    }''')
+                    if dom_src and "douyinvod.com" in dom_src and not dom_src.startswith("blob:"):
+                        single_media_url = dom_src
+
+                    # 模式B：等待 3 秒以上且已经捕获到单流，但页面未发起 DASH 分流请求
+                    if i >= 6 and single_media_url and not dash_video_url and not dash_audio_url:
+                        break
+
                     page.wait_for_timeout(500)
 
                 raw_title = page.title() or ""
-                # 清理标题末尾的 " - 抖音" 后缀
                 title = re.sub(r'\s*-\s*抖音$', '', raw_title).strip()
             finally:
                 browser.close()
 
-        if not video_url or not audio_url:
-            raise RuntimeError("未能从页面中成功嗅探到完整音视频流，可能网络超时或链接已失效。")
-
-        return title or "抖音视频", video_url, audio_url
+        # 决策判断分流还是单流
+        if dash_video_url and dash_audio_url:
+            return title or "抖音视频", dash_video_url, dash_audio_url, False
+        elif single_media_url:
+            return title or "抖音视频", single_media_url, "", True
+        elif dash_video_url and not dash_audio_url:
+            # 仅捕获到视频轨且为普通 MP4
+            return title or "抖音视频", dash_video_url, "", True
+        else:
+            raise RuntimeError("未能从页面中成功嗅探到有效媒体流，可能链接已失效或网络超时。")
 
     @classmethod
     def parse(cls, raw_input: str) -> ParsedVideoInfo:
@@ -112,12 +135,13 @@ class DouyinParser:
             raise ValueError("未检测到有效的抖音链接，请确认输入的链接格式。")
 
         real_url, video_id = cls.resolve_real_url(extracted)
-        title, video_url, audio_url = cls.sniff_streams_via_edge(real_url)
+        title, video_url, audio_url, is_single_stream = cls.sniff_streams_via_edge(real_url)
 
         return ParsedVideoInfo(
             video_id=video_id,
             title=title,
             video_url=video_url,
             audio_url=audio_url,
-            share_url=real_url
+            share_url=real_url,
+            is_single_stream=is_single_stream
         )
